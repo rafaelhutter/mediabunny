@@ -58,6 +58,7 @@ type MpegTsTrackData = {
 	streamId: number;
 	codecString: string;
 	timestampProcessingQueue: QueuedPacket[];
+	reorderDelay: number;
 	packetQueue: QueuedPacket[];
 	inputIsAnnexB: boolean | null;
 	inputIsAdts: boolean | null;
@@ -137,6 +138,7 @@ export class MpegTsMuxer extends Muxer {
 			streamId,
 			codecString: meta.decoderConfig.codec,
 			timestampProcessingQueue: [],
+			reorderDelay: 0,
 			packetQueue: [],
 			inputIsAnnexB: null,
 			inputIsAdts: null,
@@ -208,6 +210,7 @@ export class MpegTsMuxer extends Muxer {
 			streamId,
 			codecString: meta.decoderConfig.codec,
 			timestampProcessingQueue: [],
+			reorderDelay: 0,
 			packetQueue: [],
 			inputIsAnnexB: null,
 			inputIsAdts: null,
@@ -480,9 +483,19 @@ export class MpegTsMuxer extends Muxer {
 			.map(packet => packet.presentationTimestamp)
 			.sort((a, b) => a - b);
 
+		// Using the sorted timestamps directly as DTS would make DTS > PTS for reordered frames (B-frames), which is
+		// invalid. So, shift DTS back by the largest amount any frame has been reordered by so far.
 		for (let i = 0; i < trackData.timestampProcessingQueue.length; i++) {
 			const queuedPacket = trackData.timestampProcessingQueue[i]!;
-			queuedPacket.decodeTimestamp = sortedTimestamps[i]!;
+			trackData.reorderDelay = Math.max(
+				trackData.reorderDelay,
+				sortedTimestamps[i]! - queuedPacket.presentationTimestamp,
+			);
+		}
+
+		for (let i = 0; i < trackData.timestampProcessingQueue.length; i++) {
+			const queuedPacket = trackData.timestampProcessingQueue[i]!;
+			queuedPacket.decodeTimestamp = sortedTimestamps[i]! - trackData.reorderDelay;
 			trackData.packetQueue.push(queuedPacket);
 		}
 

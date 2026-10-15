@@ -739,6 +739,32 @@ test('MPEG-TS muxing with StreamTarget', async () => {
 	expect(videoPacketCount).toBe(frameCount);
 });
 
+test('MPEG-TS muxing writes DTS no later than PTS for reordered video', async () => {
+	using input = new Input({
+		source: new UrlSource('/demo.mp4'), // H.264 with B-frames
+		formats: ALL_FORMATS,
+	});
+
+	const output = new Output({
+		format: new MpegTsOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const conversion = await Conversion.init({ input, output, audio: { discard: true } });
+	await conversion.execute();
+
+	const timestamps = readVideoPesTimestamps(new Uint8Array(output.target.buffer!));
+	expect(timestamps.some(({ pts }, i) => i > 0 && pts < timestamps[i - 1]!.pts)).toBe(true); // Has reordering
+
+	for (let i = 0; i < timestamps.length; i++) {
+		expect(timestamps[i]!.dts).toBeLessThanOrEqual(timestamps[i]!.pts);
+
+		if (i > 0) {
+			expect(timestamps[i]!.dts).toBeGreaterThan(timestamps[i - 1]!.dts);
+		}
+	}
+});
+
 test('MPEG-TS muxing with negative start timestamps', async () => {
 	await testNegativeTimestampRoundTrip(Array.from({ length: 50 }, (_, index) => (index - 10) / 10), 0.1);
 });
@@ -801,4 +827,36 @@ const testNegativeTimestampRoundTrip = async (timestamps: number[], duration: nu
 			duration: outputPacket.duration,
 		}).toEqual(expectedPacket);
 	}
+};
+
+/** Reads PTS and DTS, in 90 kHz ticks, from the PES headers of the first track (assumed to be video). */
+const readVideoPesTimestamps = (bytes: Uint8Array) => {
+	const timestamps: { pts: number; dts: number }[] = [];
+
+	for (let pos = 0; pos + 188 <= bytes.length; pos += 188) {
+		const pid = ((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!;
+		const payloadUnitStart = (bytes[pos + 1]! & 0x40) !== 0;
+		if (pid !== 0x100 || !payloadUnitStart) {
+			continue;
+		}
+
+		const hasAdaptationField = (bytes[pos + 3]! & 0x20) !== 0;
+		const pesStart = pos + 4 + (hasAdaptationField ? 1 + bytes[pos + 4]! : 0);
+		expect(bytes[pesStart + 7]! >> 6).toBe(0b11); // PTS and DTS present
+
+		timestamps.push({
+			pts: readPesTimestamp(bytes, pesStart + 9),
+			dts: readPesTimestamp(bytes, pesStart + 14),
+		});
+	}
+
+	return timestamps;
+};
+
+const readPesTimestamp = (bytes: Uint8Array, offset: number) => {
+	const value = ((bytes[offset]! >> 1) & 0x7) * 2 ** 30
+		+ ((bytes[offset + 1]! << 7) | (bytes[offset + 2]! >> 1)) * 2 ** 15
+		+ ((bytes[offset + 3]! << 7) | (bytes[offset + 4]! >> 1));
+
+	return value >= 2 ** 32 ? value - 2 ** 33 : value; // Negative timestamps are written modulo 2^33
 };
